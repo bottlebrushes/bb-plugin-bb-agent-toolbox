@@ -2,7 +2,6 @@ import { type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { type BbContext, type JsonValue } from "@get-bb/plugin-sdk";
 import { type Flags, requireProjectId, requireThreadId, sleep, threadTitle, type Registrar } from "../lib/toolkit";
-import { resolveHost } from "../lib/resolve-host";
 
 // Loose shape of the interactions the SDK returns; the union differs across providers.
 type InteractionRow = {
@@ -17,6 +16,43 @@ type InteractionRow = {
     title?: string;
   };
 };
+
+type SpawnEnvironment = Parameters<BbPluginApi["sdk"]["threads"]["spawn"]>[0]["environment"];
+// The bb server accepts `{ type: "provider" }` environments; the SDK's spawn types predate it.
+type ProviderSelection = {
+  machine?:
+    | { type: "new"; machineProviderId: string; inputs: unknown }
+    | { type: "existing"; hostId: string };
+  inputs?: unknown;
+};
+
+// A thread whose environment was provisioned together with a new machine
+// (boxes.dev, Modal, ...) gives each child a new machine from the same
+// providers: reusing it would pin every child to the parent's machine and
+// its per-host concurrency limit.
+function childEnvironment(
+  env:
+    | {
+        id?: string | null;
+        environmentProviderId?: string | null;
+        environmentProviderSelection?: ProviderSelection | null;
+      }
+    | null
+    | undefined,
+  shareEnvironment: boolean,
+) {
+  if (!env?.id) return { type: "project-default" } as const;
+  const selection = env.environmentProviderSelection;
+  if (!shareEnvironment && env.environmentProviderId && selection?.machine?.type === "new") {
+    return {
+      type: "provider",
+      environmentProviderId: env.environmentProviderId,
+      machine: selection.machine,
+      inputs: selection.inputs ?? null,
+    } as const;
+  }
+  return { type: "reuse", environmentId: env.id } as const;
+}
 
 function describeInteraction(item: InteractionRow): string {
   const p = item.payload;
@@ -163,7 +199,7 @@ export function registerThreadTools(
   register("threads", {
     name: "bbtools_thread_spawn",
     description:
-      "Create a new bb thread (child of the current one). Use it to delegate parallel or background work to another agent thread. Defaults to the current thread's provider and environment; pass providerId/model to override.",
+      "Create a new bb thread (child of the current one). Use it to delegate parallel or background work to another agent thread. Defaults to the current thread's provider. When the current thread runs on a machine bb provisioned for it (e.g. a boxes.dev devbox), the child gets its own new machine of the same kind, so children don't share the parent's machine or its concurrency slots; set shareEnvironment to run the child in the current thread's environment instead (only when it must see uncommitted files there). Otherwise the child reuses the current environment. Pass providerId/model to override.",
     parameters: z.object({
       prompt: z.string().min(1).describe("The initial prompt for the new thread."),
       providerId: z.string().optional().describe("Provider id (defaults to the current thread's)."),
@@ -176,31 +212,30 @@ export function registerThreadTools(
         .enum(["accept-edits", "auto", "full"])
         .optional()
         .describe("Permission mode (default: full)."),
+      shareEnvironment: z
+        .boolean()
+        .optional()
+        .describe(
+          "Run the child in the current thread's environment even when that environment has its own provisioned machine (default: false).",
+        ),
     }),
-    execute: async ({ prompt, providerId, model, reasoningLevel, permissionMode }, ctx) => {
+    execute: async ({ prompt, providerId, model, reasoningLevel, permissionMode, shareEnvironment }, ctx) => {
       const threadId = requireThreadId(ctx);
       const projectId = requireProjectId(ctx);
-      const current = await bb.sdk.threads.get({ threadId });
+      const current = await bb.sdk.threads.get({ threadId, include: "environment" });
       const resolvedProvider = providerId ?? current.providerId;
       if (!resolvedProvider) return "Error: no provider on the current thread; pass providerId.";
-      // Reuse the current thread's environment when it has one, else fall back to the project default.
-      const environment = await (async () => {
-        try {
-          const { environmentId } = await resolveHost(bb, threadId);
-          return environmentId
-            ? ({ type: "reuse", environmentId } as const)
-            : ({ type: "project-default" } as const);
-        } catch {
-          return { type: "project-default" } as const;
-        }
-      })();
+      const environment = childEnvironment(
+        "environment" in current ? current.environment : undefined,
+        shareEnvironment ?? false,
+      );
       const thread = await bb.sdk.threads.spawn({
         projectId,
         providerId: resolvedProvider,
         ...(model ? { model } : {}),
         ...(reasoningLevel ? { reasoningLevel } : {}),
         permissionMode: permissionMode ?? "full",
-        environment,
+        environment: environment as SpawnEnvironment,
         parentThreadId: threadId,
         input: [{ type: "text", text: prompt, mentions: [] }],
         origin: "plugin",
